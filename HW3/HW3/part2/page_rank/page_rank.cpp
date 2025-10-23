@@ -1,8 +1,9 @@
 #include "page_rank.h"
 
-#include <cmath>
+#include <cmath> // Needed for std::abs
 #include <cstdlib>
 #include <omp.h>
+#include <vector>
 
 #include "../common/graph.h"
 
@@ -15,43 +16,91 @@
 //
 void page_rank(Graph g, double *solution, double damping, double convergence)
 {
-
-    // initialize vertex weights to uniform probability. Double
-    // precision scores are used to avoid underflow for large graphs
-
     int nnodes = num_nodes(g);
     double equal_prob = 1.0 / nnodes;
+
+    // Parallelize the initialization loop
+    #pragma omp parallel for
     for (int i = 0; i < nnodes; ++i)
     {
         solution[i] = equal_prob;
     }
 
     /*
-       For PP students: Implement the page rank algorithm here.  You
-       are expected to parallelize the algorithm using openMP.  Your
-       solution may need to allocate (and free) temporary arrays.
-
-       Basic page rank pseudocode is provided below to get you started:
-
-       // initialization: see example code above
-       score_old[vi] = 1/nnodes;
-
-       while (!converged) {
-
-         // compute score_new[vi] for all nodes vi:
-         score_new[vi] = sum over all nodes vj reachable from incoming edges
-                            { score_old[vj] / number of edges leaving vj  }
-         score_new[vi] = (damping * score_new[vi]) + (1.0-damping) / nnodes;
-
-         score_new[vi] += sum over all nodes v in graph with no outgoing edges
-                            { damping * score_old[v] / nnodes }
-
-         // compute how much per-node scores have changed
-         // quit once algorithm has converged
-
-         global_diff = sum over all nodes vi { abs(score_new[vi] - score_old[vi]) };
-         converged = (global_diff < convergence)
-       }
-
+       (Pseudocode comments omitted for brevity)
      */
+
+    // 1. Allocate a temporary array to store 'score_new'
+    //    Using std::vector for automatic memory management (RAII)
+    std::vector<double> score_new(nnodes);
+    bool converged = false;
+
+    // 3. Pre-calculate the constant base contribution
+    const double base_contrib = (1.0 - damping) / nnodes;
+
+    while (!converged)
+    {
+        // --- Pseudocode Steps 1 & 2: Handle Dangling Nodes ---
+        double dangling_sum = 0.0;
+        
+        #pragma omp parallel for reduction(+:dangling_sum)
+        for (int v = 0; v < nnodes; ++v)
+        {
+            if (outgoing_size(g, v) == 0)
+            {
+                // The solution array acts as score_old at this point
+                dangling_sum += solution[v];
+            }
+        }
+        
+        double dangling_contrib = damping * dangling_sum / nnodes;
+
+        // --- Pseudocode Step 1: Compute score_new ---
+        #pragma omp parallel for
+        for (int vi = 0; vi < nnodes; ++vi)
+        {
+            double sum_from_neighbors = 0.0;
+
+            const Vertex* start = incoming_begin(g, vi);
+            const Vertex* end = incoming_end(g, vi);
+
+            for (const Vertex* vj_ptr = start; vj_ptr != end; ++vj_ptr)
+            {
+                int vj = *vj_ptr;
+                int num_outgoing_vj = outgoing_size(g, vj);
+                
+                if (num_outgoing_vj > 0)
+                {
+                    sum_from_neighbors += solution[vj] / num_outgoing_vj;
+                }
+            }
+
+            // Apply damping factor and pre-calculated base probability
+            score_new[vi] = (damping * sum_from_neighbors) + base_contrib;
+
+            // Add the contribution from all dangling nodes
+            score_new[vi] += dangling_contrib;
+        }
+
+
+        // --- Pseudocode Step 3 & 4: Check convergence AND Prepare for next iteration ---
+        //    (Loops are fused into one pass)
+        
+        double global_diff = 0.0;
+        
+        #pragma omp parallel for reduction(+:global_diff)
+        for (int vi = 0; vi < nnodes; ++vi)
+        {
+            // Step 3: Check for convergence
+            global_diff += std::abs(score_new[vi] - solution[vi]);
+            
+            // Step 4: Prepare for next iteration (Copy)
+            solution[vi] = score_new[vi];
+        }
+        
+        converged = (global_diff < convergence);
+
+    } // end while(!converged)
+
+    // 5. No need to 'delete[] score_new', std::vector handles it automatically
 }
